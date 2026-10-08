@@ -23,8 +23,9 @@ Two equivalent toolchains — use whichever your agent provides:
 - `node <skill-dir>/autoresearch.mjs run [command] [--timeout <s>] [--checks-timeout <s>]` — `run_experiment`. Defaults to `bash .auto/measure.sh`; parses `METRIC` lines; runs `.auto/checks.sh` after a passing benchmark.
 - `node <skill-dir>/autoresearch.mjs log --status keep|discard|crash|checks_failed --metric <n> --commit <sha> --description "<text>" [--metrics '<json>'] [--asi '<json>'] [--force]` — `log_experiment`. Auto-commits on `keep`, auto-reverts (preserving `.auto/`) otherwise, fires `.auto/hooks/{before,after}.sh`, prints baseline/delta/confidence.
 - `node <skill-dir>/autoresearch.mjs status` — session snapshot (baseline, best kept, confidence, recent runs). Portable-mode replacement for the pi widget/dashboard; use it when resuming.
+- `node <skill-dir>/autoresearch.mjs dashboard [--out <file>] [--open]` — writes a self-contained HTML report (stat cards, metric-over-runs chart, runs table) to `.auto/dashboard.html`. `--open` launches it in the browser.
 
-Below, `init_experiment` / `run_experiment` / `log_experiment` mean whichever toolchain is active. In portable mode there is no `/autoresearch` command, widget, or dashboard — `.auto/log.jsonl` + `status` are the source of truth.
+Below, `init_experiment` / `run_experiment` / `log_experiment` mean whichever toolchain is active. In portable mode there is no `/autoresearch` command or widget — `.auto/log.jsonl` + `status`/`dashboard` are the source of truth.
 
 ## Session files
 
