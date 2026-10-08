@@ -13,6 +13,7 @@
  *                        --commit <sha> --description "<text>"
  *                        [--metrics '<json>'] [--asi '<json>'] [--force]
  *   autoresearch.mjs status
+ *   autoresearch.mjs dashboard [--out <file>] [--open]
  *
  * Produces the same .auto/log.jsonl schema as the pi extension, so
  * autoresearch-finalize works identically on both runtimes.
@@ -639,6 +640,177 @@ function cmdStatus() {
 }
 
 // ---------------------------------------------------------------------------
+// dashboard — self-contained HTML report of the session
+// ---------------------------------------------------------------------------
+const STATUS_COLORS = { keep: "#34c759", discard: "#86868b", crash: "#ff3b30", checks_failed: "#ff9500" };
+const escHtml = (s) =>
+  String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+function renderDashboardHtml(st) {
+  const snap = sessionSnapshot(st);
+  const conf = computeConfidence(st);
+  const multi = st.results.some((r) => r.segment > 0);
+  const generated = new Date().toISOString().replace("T", " ").slice(0, 19) + "Z";
+
+  let improvement = "—";
+  if (snap.baseline_metric !== null && snap.best_metric !== null && snap.baseline_metric !== 0) {
+    const imp =
+      st.bestDirection === "lower"
+        ? (snap.baseline_metric - snap.best_metric) / Math.abs(snap.baseline_metric)
+        : (snap.best_metric - snap.baseline_metric) / Math.abs(snap.baseline_metric);
+    improvement = (imp >= 0 ? "+" : "") + (imp * 100).toFixed(1) + "%";
+  }
+
+  // Metric trend chart — inline SVG, all runs in chronological order.
+  const W = 880, H = 220, PAD = 44;
+  let chart = "";
+  if (st.results.length) {
+    const vals = st.results.map((r) => r.metric);
+    const lo = Math.min(...vals, snap.baseline_metric ?? Infinity);
+    const hi = Math.max(...vals, snap.baseline_metric ?? -Infinity);
+    const span = hi - lo || 1;
+    const x = (i) => (st.results.length === 1 ? W / 2 : PAD + (i * (W - 2 * PAD)) / (st.results.length - 1));
+    const y = (v) => H - PAD - ((v - lo) / span) * (H - 2 * PAD);
+    if (snap.baseline_metric !== null)
+      chart += `<line x1="${PAD}" y1="${y(snap.baseline_metric)}" x2="${W - PAD}" y2="${y(snap.baseline_metric)}" stroke="#d2d2d7" stroke-dasharray="6 4" stroke-width="1.5"/>`;
+    // Raw metric per run — thin muted line.
+    if (st.results.length > 1)
+      chart += `<polyline fill="none" stroke="#b8b8bf" stroke-width="1.5" stroke-linejoin="round" points="${st.results.map((r, i) => `${x(i)},${y(r.metric)}`).join(" ")}"/>`;
+    // Running best-kept — bold highlighted step line showing improvement.
+    // Resets at each segment (re-init starts a fresh baseline).
+    const runningBest = [];
+    let rb = null;
+    let lastSeg = null;
+    for (const r of st.results) {
+      if (r.segment !== lastSeg) { rb = null; lastSeg = r.segment; }
+      if (r.status === "keep" && (rb === null || isBetter(r.metric, rb, st.bestDirection))) rb = r.metric;
+      runningBest.push(rb);
+    }
+    if (rb !== null) {
+      let d = "";
+      let prev = null;
+      st.results.forEach((r, i) => {
+        const v = runningBest[i];
+        if (v === null) { prev = null; return; }
+        if (prev === null) d += `M ${x(i)},${y(v)}`;
+        else if (v === prev) d += ` L ${x(i)},${y(v)}`;
+        else d += ` L ${x(i)},${y(prev)} L ${x(i)},${y(v)}`;
+        prev = v;
+      });
+      chart += `<path d="${d}" fill="none" stroke="#0071e3" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>`;
+    }
+    st.results.forEach((r, i) => {
+      chart += `<circle cx="${x(i)}" cy="${y(r.metric)}" r="5.5" fill="${STATUS_COLORS[r.status] || "#86868b"}" stroke="#fff" stroke-width="2"><title>#${r.run} ${escHtml(r.status)} — ${formatNum(r.metric, snap.metric_unit)} — ${escHtml(r.description)}</title></circle>`;
+    });
+    chart += `<text x="8" y="${y(hi) + 4}" font-size="11" fill="#86868b">${formatNum(hi, snap.metric_unit)}</text>`;
+    chart += `<text x="8" y="${y(lo) + 4}" font-size="11" fill="#86868b">${formatNum(lo, snap.metric_unit)}</text>`;
+    if (snap.baseline_metric !== null)
+      chart += `<text x="${W - PAD + 6}" y="${y(snap.baseline_metric) + 4}" font-size="11" fill="#86868b">baseline</text>`;
+  }
+
+  const rows = st.results.map((r) => {
+    const d = r.status !== "crash" && snap.baseline_metric !== null && snap.baseline_metric !== 0
+      ? (r.metric - snap.baseline_metric) / Math.abs(snap.baseline_metric)
+      : null;
+    const good = d !== null && (st.bestDirection === "lower" ? d < 0 : d > 0);
+    const dStr = d !== null && Math.abs(d) > 0.000001
+      ? ` <span class="${good ? "good" : "bad"}">(${d > 0 ? "+" : ""}${(d * 100).toFixed(1)}%)</span>`
+      : "";
+    const secondary = Object.keys(r.metrics).length
+      ? ` <div class="muted">${escHtml(Object.entries(r.metrics).map(([k, v]) => `${k}=${formatNum(v)}`).join(", "))}</div>`
+      : "";
+    const seg = multi ? ` <span class="muted">s${r.segment}</span>` : "";
+    const ts = typeof r.raw?.timestamp === "number"
+      ? new Date(r.raw.timestamp).toISOString().slice(5, 16).replace("T", " ")
+      : "";
+    return `<tr><td class="num">#${r.run}${seg}</td><td><span class="badge" style="background:${STATUS_COLORS[r.status] || "#86868b"}">${escHtml(r.status)}</span></td><td class="mono">${escHtml(r.commit || "—")}</td><td class="num">${formatNum(r.metric, snap.metric_unit)}${dStr}</td><td>${escHtml(r.description)}${secondary}</td><td class="muted">${ts}</td></tr>`;
+  }).join("");
+
+  const legend =
+    `<span><svg width="16" height="8" style="vertical-align:1px"><line x1="0" y1="4" x2="16" y2="4" stroke="#0071e3" stroke-width="3"/></svg> best kept</span>` +
+    `<span><svg width="16" height="8" style="vertical-align:1px"><line x1="0" y1="4" x2="16" y2="4" stroke="#b8b8bf" stroke-width="1.5"/></svg> each run</span>` +
+    Object.entries(STATUS_COLORS)
+      .map(([k, c]) => `<span><span class="dot" style="background:${c}"></span>${k}</span>`)
+      .join("");
+
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>autoresearch — ${escHtml(snap.goal)}</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif; background: #f5f5f7; color: #1d1d1f; padding: 32px 16px; -webkit-font-smoothing: antialiased; }
+  .wrap { max-width: 960px; margin: 0 auto; }
+  h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.02em; }
+  .sub { color: #6e6e73; margin-top: 6px; font-size: 15px; }
+  .sub b { color: #1d1d1f; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px,1fr)); gap: 12px; margin: 24px 0; }
+  .card { background: #fff; border-radius: 14px; padding: 16px 18px; box-shadow: 0 1px 3px rgba(0,0,0,.06); }
+  .card .k { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: #86868b; }
+  .card .v { font-size: 24px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .panel { background: #fff; border-radius: 14px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,.06); margin-bottom: 20px; }
+  .panel h2 { font-size: 17px; font-weight: 600; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #86868b; font-weight: 600; padding: 8px 10px; border-bottom: 1px solid #e8e8ed; }
+  td { padding: 10px; border-bottom: 1px solid #f0f0f4; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; color: #fff; font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 999px; }
+  .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: 13px; }
+  .muted { color: #86868b; font-size: 12.5px; margin-top: 2px; }
+  .good { color: #248a3d; } .bad { color: #d70015; }
+  .legend { display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; color: #6e6e73; margin-top: 10px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+  footer { text-align: center; color: #86868b; font-size: 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>${escHtml(snap.goal)}</h1>
+  <div class="sub">metric <b>${escHtml(snap.metric_name)}</b>${snap.metric_unit ? ` (${escHtml(snap.metric_unit)})` : ""} — ${snap.direction} is better · generated ${escHtml(generated)}</div>
+  <div class="cards">
+    <div class="card"><div class="k">Baseline</div><div class="v">${formatNum(snap.baseline_metric, snap.metric_unit)}</div></div>
+    <div class="card"><div class="k">Best kept</div><div class="v">${formatNum(snap.best_metric, snap.metric_unit)}</div></div>
+    <div class="card"><div class="k">Improvement</div><div class="v">${improvement}</div></div>
+    <div class="card"><div class="k">Runs</div><div class="v">${snap.run_count}</div></div>
+    <div class="card"><div class="k">Confidence</div><div class="v">${conf !== null ? escHtml(conf.toFixed(1)) + "×" : "—"}</div></div>
+  </div>
+  <div class="panel"><h2>Metric over runs</h2>
+    ${chart ? `<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block">${chart}</svg><div class="legend">${legend}<span><span class="dot" style="background:#fff;border:1px dashed #d2d2d7"></span>baseline</span></div>` : `<div class="muted">No runs yet.</div>`}
+  </div>
+  <div class="panel"><h2>Runs</h2>
+    ${rows ? `<table><thead><tr><th>Run</th><th>Status</th><th>Commit</th><th>${escHtml(snap.metric_name)}</th><th>Description</th><th>Time</th></tr></thead><tbody>${rows}</tbody></table>` : `<div class="muted">No runs yet.</div>`}
+  </div>
+  <footer>autoresearch.mjs dashboard · data: .auto/log.jsonl</footer>
+</div>
+</body>
+</html>
+`;
+}
+
+function cmdDashboard(args) {
+  const cwd = process.cwd();
+  const workDir = resolveWorkDir(cwd);
+  if (!readEntries(workDir).length) die("No autoresearch session (.auto/log.jsonl not found).");
+  const st = reconstruct(readEntries(workDir));
+  const outFile =
+    typeof args.out === "string" ? path.resolve(cwd, args.out) : path.join(workDir, AUTO_DIR, "dashboard.html");
+  fs.mkdirSync(path.dirname(outFile), { recursive: true });
+  fs.writeFileSync(outFile, renderDashboardHtml(st));
+  out(`Dashboard written to ${outFile} (${st.results.length} run${st.results.length === 1 ? "" : "s"})`);
+  if (args.open === true || args.open === "true") {
+    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? "cmd" : "xdg-open";
+    const oargs = process.platform === "win32" ? ["/c", "start", "", outFile] : [outFile];
+    const child = spawn(opener, oargs, { stdio: "ignore", detached: true });
+    child.on("error", () => {});
+    child.unref();
+  }
+}
+
+// ---------------------------------------------------------------------------
 const [cmd, ...rest] = process.argv.slice(2);
 const args = parseArgs(rest);
 switch (cmd) {
@@ -646,6 +818,7 @@ switch (cmd) {
   case "run": await cmdRun(args); break;
   case "log": cmdLog(args); break;
   case "status": cmdStatus(); break;
+  case "dashboard": cmdDashboard(args); break;
   default:
     out(`autoresearch.mjs — portable autoresearch runtime
 
@@ -654,6 +827,7 @@ Commands:
   run    [command] [--timeout <s>] [--checks-timeout <s>]
   log    --status keep|discard|crash|checks_failed --metric <n> --commit <sha>
          --description "<text>" [--metrics '<json>'] [--asi '<json>'] [--force]
-  status`);
+  status
+  dashboard [--out <file>] [--open]`);
     process.exit(cmd ? 1 : 0);
 }
